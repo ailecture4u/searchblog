@@ -13,12 +13,101 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 import time
 import random
+import redis
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_openai import OpenAIEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain.chains import RetrievalQA
+from langchain_openai import ChatOpenAI
+import json
+from datetime import datetime
 
 # 환경 변수 로드
 load_dotenv()
 
-# Perplexity API 설정
+# API 키 설정
 PERPLEXITY_API_KEY = os.getenv("PERPLEXITY_API_KEY")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
+
+# Redis 클라이언트 초기화
+redis_client = redis.from_url(REDIS_URL)
+
+def save_to_cache(key: str, data):
+    """데이터를 Redis 캐시에 저장"""
+    try:
+        # 문자열이든 딕셔너리든 모두 처리할 수 있도록 수정
+        if isinstance(data, dict):
+            redis_client.setex(key, 3600, json.dumps(data))
+        else:
+            redis_client.setex(key, 3600, data)
+    except Exception as e:
+        print(f"캐시 저장 중 오류 발생: {e}")
+
+def get_from_cache(key: str):
+    """Redis 캐시에서 데이터 조회"""
+    try:
+        data = redis_client.get(key)
+        if data:
+            try:
+                return json.loads(data)
+            except json.JSONDecodeError:
+                return data.decode('utf-8')
+        return None
+    except Exception as e:
+        print(f"캐시 조회 중 오류 발생: {e}")
+        return None
+
+def create_vector_store(texts: List[str]):
+    """텍스트를 임베딩하여 벡터 저장소 생성"""
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1000,
+        chunk_overlap=200
+    )
+    splits = text_splitter.split_text("\n".join(texts))
+    
+    embeddings = OpenAIEmbeddings()
+    vectorstore = FAISS.from_texts(splits, embeddings)
+    return vectorstore
+
+def generate_blog_post(query: str, vectorstore) -> str:
+    """RAG를 사용하여 블로그 글 생성"""
+    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.7)
+    qa_chain = RetrievalQA.from_chain_type(
+        llm,
+        retriever=vectorstore.as_retriever(search_kwargs={"k": 10}),
+        chain_type="stuff",
+        return_source_documents=True
+    )
+    
+    prompt = f"""
+    다음 주제에 대해 제공된 모든 정보를 활용하여 상세한 블로그 글을 작성해주세요.
+    주제: {query}
+    """
+    
+    try:
+        # deprecation 경고 해결: __call__ 대신 invoke 사용
+        result = qa_chain.invoke({"query": prompt})
+        generated_text = result["result"]
+        
+        # 결과가 너무 짧은 경우 보완 요청
+        if len(generated_text) < 2000:
+            supplement_prompt = f"""
+            앞서 생성된 글의 내용이 충분하지 않습니다. 내용을 추가로 보완해주세요.
+            
+            기존 내용:
+            {generated_text}
+            """
+            
+            supplement_result = qa_chain.invoke({"query": supplement_prompt})
+            generated_text = supplement_result["result"]
+        
+        return generated_text
+        
+    except Exception as e:
+        print(f"글 생성 중 오류 발생: {e}")
+        print(f"오류 상세: {str(e)}")
+        return "블로그 글 생성에 실패했습니다. 다시 시도해주세요."
 
 def fetch_links_direct(query: str) -> List[str]:
     """Perplexity API를 직접 호출하여 링크 가져오기"""
@@ -179,6 +268,13 @@ def crawl_links(links: List[str]) -> List[Dict]:
     results = []
     
     for url in links:
+        # 캐시 확인
+        cached_data = get_from_cache(f"crawl:{url}")
+        if cached_data:
+            print(f"캐시에서 {url} 데이터를 찾았습니다.")
+            results.append(cached_data)
+            continue
+            
         print(f"\n{url} 크롤링 중...")
         
         # Playwright로 먼저 시도
@@ -191,11 +287,14 @@ def crawl_links(links: List[str]) -> List[Dict]:
         
         if success:
             print(f"✅ 성공: {url}")
-            results.append({
+            result = {
                 'url': url,
                 'content': content,
                 'status': 'success'
-            })
+            }
+            results.append(result)
+            # 캐시에 저장
+            save_to_cache(f"crawl:{url}", result)
         else:
             print(f"❌ 실패: {url}")
             print(f"실패 원인: {content}")
@@ -218,11 +317,11 @@ def save_results_to_csv(results: List[Dict], filename: str):
 
 def main():
     """메인 프로그램 실행"""
-    print("Perplexity AI 검색 링크 수집 및 크롤링 프로그램")
+    print("블로그 글 생성 프로그램")
     print("--------------------------------------------")
     
     # 사용자 입력 받기
-    query = input("검색할 키워드 또는 내용을 입력하세요: ")
+    query = input("블로그 글의 주제를 입력하세요: ")
     
     print(f"'{query}'에 대한 검색 중...")
     
@@ -233,28 +332,37 @@ def main():
         print("검색 결과에서 링크를 찾을 수 없습니다.")
         return
     
-    # 결과 출력
-    print(f"\n검색 결과: {len(links)}개의 링크를 찾았습니다.\n")
-    for idx, link in enumerate(links, 1):
-        print(f"{idx}. {link}")
-    
     # 크롤링 실행
     print("\n크롤링을 시작합니다...")
     results = crawl_links(links)
     
-    # 파일명 설정
-    filename = input("\n저장할 CSV 파일명을 입력하세요 (기본값: crawled_results.csv): ")
-    if not filename:
-        filename = "crawled_results.csv"
-    elif not filename.endswith('.csv'):
-        filename += ".csv"
+    # 성공적으로 크롤링된 내용만 추출
+    successful_contents = [r['content'] for r in results if r['status'] == 'success']
     
-    # 결과 저장
-    save_results_to_csv(results, filename)
+    if not successful_contents:
+        print("크롤링에 실패했습니다.")
+        return
     
-    # 성공/실패 통계 출력
-    success_count = sum(1 for r in results if r['status'] == 'success')
-    print(f"\n크롤링 완료: {success_count}/{len(results)}개 성공")
+    # 벡터 저장소 생성
+    print("\n벡터 저장소 생성 중...")
+    vectorstore = create_vector_store(successful_contents)
+    
+    # 블로그 글 생성
+    print("\n블로그 글 생성 중...")
+    blog_post = generate_blog_post(query, vectorstore)
+    
+    # 결과 출력
+    print("\n생성된 블로그 글:")
+    print(blog_post)
+    
+    # 현재 시간 가져오기
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    # 파일로 저장 (타임스탬프 추가)
+    filename = f"blog_{query.replace(' ', '_')}_{timestamp}.txt"
+    with open(filename, 'w', encoding='utf-8') as f:
+        f.write(blog_post)
+    print(f"\n블로그 글이 {filename}에 저장되었습니다.")
 
 if __name__ == "__main__":
     main() 
